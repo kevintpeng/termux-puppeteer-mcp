@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "puppeteer": {
+      "command": "/data/data/com.termux/files/usr/bin/node",
+      "args": ["/data/data/com.termux/files/home/termux-puppeteer-mcp/index.js"]
+    }
+  }
+}

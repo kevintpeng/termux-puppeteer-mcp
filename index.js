@@ -1,0 +1,324 @@
+#!/usr/bin/env node
+
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from '@modelcontextprotocol/sdk/types.js';
+import { execSync } from 'child_process';
+import { writeFileSync, readFileSync, unlinkSync } from 'fs';
+import { join } from 'path';
+
+const server = new Server(
+  {
+    name: 'termux-puppeteer-mcp',
+    version: '1.0.0',
+  },
+  {
+    capabilities: {
+      tools: {},
+    },
+  }
+);
+
+// Helper function to execute code in Alpine with Puppeteer
+function runInAlpine(code) {
+  const scriptPath = `/root/mcp-script-${Date.now()}.js`;
+  const tempLocalScript = join('/data/data/com.termux/files/home', `temp-${Date.now()}.js`);
+
+  // Write the script locally first
+  writeFileSync(tempLocalScript, code);
+
+  try {
+    // Copy script to Alpine and execute
+    const result = execSync(
+      `proot-distro login alpine -- sh -c "cat > ${scriptPath} << 'EOFSCRIPT'\n${code}\nEOFSCRIPT\nnode ${scriptPath} && rm ${scriptPath}"`,
+      { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }
+    );
+
+    unlinkSync(tempLocalScript);
+    return result;
+  } catch (error) {
+    unlinkSync(tempLocalScript);
+    throw new Error(`Alpine execution failed: ${error.message}\nStderr: ${error.stderr}`);
+  }
+}
+
+// Define Puppeteer tools
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  return {
+    tools: [
+      {
+        name: 'puppeteer_navigate',
+        description: 'Navigate to a URL and get the page content, title, and optionally take a screenshot',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            url: {
+              type: 'string',
+              description: 'The URL to navigate to',
+            },
+            screenshot: {
+              type: 'boolean',
+              description: 'Whether to take a screenshot (returns base64)',
+              default: false,
+            },
+          },
+          required: ['url'],
+        },
+      },
+      {
+        name: 'puppeteer_screenshot',
+        description: 'Take a screenshot of a URL and return it as base64 JPEG (compressed to fit token limit)',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            url: {
+              type: 'string',
+              description: 'The URL to screenshot',
+            },
+            width: {
+              type: 'number',
+              description: 'Viewport width (max 800)',
+              default: 800,
+            },
+            height: {
+              type: 'number',
+              description: 'Viewport height (max 600)',
+              default: 600,
+            },
+          },
+          required: ['url'],
+        },
+      },
+      {
+        name: 'puppeteer_pdf',
+        description: 'Generate a PDF from a URL and return it as base64',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            url: {
+              type: 'string',
+              description: 'The URL to convert to PDF',
+            },
+          },
+          required: ['url'],
+        },
+      },
+      {
+        name: 'puppeteer_evaluate',
+        description: 'Execute JavaScript code in the context of a page and return the result',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            url: {
+              type: 'string',
+              description: 'The URL to navigate to',
+            },
+            script: {
+              type: 'string',
+              description: 'JavaScript code to execute in the page context',
+            },
+          },
+          required: ['url', 'script'],
+        },
+      },
+      {
+        name: 'puppeteer_click',
+        description: 'Navigate to a URL, click an element, and return the result',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            url: {
+              type: 'string',
+              description: 'The URL to navigate to',
+            },
+            selector: {
+              type: 'string',
+              description: 'CSS selector for the element to click',
+            },
+            waitForNavigation: {
+              type: 'boolean',
+              description: 'Wait for navigation after click',
+              default: false,
+            },
+          },
+          required: ['url', 'selector'],
+        },
+      },
+    ],
+  };
+});
+
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
+
+  try {
+    switch (name) {
+      case 'puppeteer_navigate': {
+        const code = `
+const puppeteer = require('puppeteer');
+(async () => {
+  const browser = await puppeteer.launch({
+    executablePath: '/usr/bin/chromium-browser',
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    headless: true
+  });
+  const page = await browser.newPage();
+  await page.setViewport({ width: 800, height: 600 });
+  await page.goto('${args.url}', { waitUntil: 'networkidle2' });
+  const title = await page.title();
+  const content = await page.content();
+  ${args.screenshot ? `
+  const screenshot = await page.screenshot({ encoding: 'base64', type: 'jpeg', quality: 60 });
+  console.log(JSON.stringify({ title, contentLength: content.length, screenshot }));
+  ` : `
+  console.log(JSON.stringify({ title, contentLength: content.length, content: content.substring(0, 5000) }));
+  `}
+  await browser.close();
+})();
+`;
+        const result = runInAlpine(code);
+        return {
+          content: [{ type: 'text', text: result }],
+        };
+      }
+
+      case 'puppeteer_screenshot': {
+        // Allow any viewport size, but scale down afterwards to stay under token limit
+        const width = args.width || 800;
+        const height = args.height || 600;
+        const code = `
+const puppeteer = require('puppeteer');
+const sharp = require('sharp');
+(async () => {
+  const browser = await puppeteer.launch({
+    executablePath: '/usr/bin/chromium-browser',
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    headless: true
+  });
+  const page = await browser.newPage();
+  await page.setViewport({ width: ${width}, height: ${height} });
+  await page.goto('${args.url}', { waitUntil: 'networkidle2' });
+  const screenshotBuffer = await page.screenshot({
+    type: 'png',
+    fullPage: false
+  });
+
+  // Scale down to max 800x600 while preserving aspect ratio
+  const resized = await sharp(screenshotBuffer)
+    .resize(800, 600, { fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: 60 })
+    .toBuffer();
+
+  const screenshot = resized.toString('base64');
+  console.log(JSON.stringify({ screenshot }));
+  await browser.close();
+})();
+`;
+        const result = runInAlpine(code);
+        return {
+          content: [{ type: 'text', text: result }],
+        };
+      }
+
+      case 'puppeteer_pdf': {
+        const code = `
+const puppeteer = require('puppeteer');
+(async () => {
+  const browser = await puppeteer.launch({
+    executablePath: '/usr/bin/chromium-browser',
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    headless: true
+  });
+  const page = await browser.newPage();
+  await page.goto('${args.url}', { waitUntil: 'networkidle2' });
+  const pdf = await page.pdf({ format: 'A4' });
+  console.log(JSON.stringify({ pdf: pdf.toString('base64') }));
+  await browser.close();
+})();
+`;
+        const result = runInAlpine(code);
+        return {
+          content: [{ type: 'text', text: result }],
+        };
+      }
+
+      case 'puppeteer_evaluate': {
+        const escapedScript = args.script.replace(/`/g, '\\`').replace(/\$/g, '\\$');
+        const code = `
+const puppeteer = require('puppeteer');
+(async () => {
+  const browser = await puppeteer.launch({
+    executablePath: '/usr/bin/chromium-browser',
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    headless: true
+  });
+  const page = await browser.newPage();
+  await page.goto('${args.url}', { waitUntil: 'networkidle2' });
+  const result = await page.evaluate(() => {
+    ${escapedScript}
+  });
+  console.log(JSON.stringify({ result }));
+  await browser.close();
+})();
+`;
+        const result = runInAlpine(code);
+        return {
+          content: [{ type: 'text', text: result }],
+        };
+      }
+
+      case 'puppeteer_click': {
+        const code = `
+const puppeteer = require('puppeteer');
+(async () => {
+  const browser = await puppeteer.launch({
+    executablePath: '/usr/bin/chromium-browser',
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    headless: true
+  });
+  const page = await browser.newPage();
+  await page.goto('${args.url}', { waitUntil: 'networkidle2' });
+  ${args.waitForNavigation ? `
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: 'networkidle2' }),
+    page.click('${args.selector}')
+  ]);
+  ` : `
+  await page.click('${args.selector}');
+  `}
+  const newUrl = page.url();
+  const title = await page.title();
+  console.log(JSON.stringify({ success: true, newUrl, title }));
+  await browser.close();
+})();
+`;
+        const result = runInAlpine(code);
+        return {
+          content: [{ type: 'text', text: result }],
+        };
+      }
+
+      default:
+        throw new Error(`Unknown tool: ${name}`);
+    }
+  } catch (error) {
+    return {
+      content: [{ type: 'text', text: `Error: ${error.message}` }],
+      isError: true,
+    };
+  }
+});
+
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error('Termux Puppeteer MCP server running');
+}
+
+main().catch((error) => {
+  console.error('Fatal error:', error);
+  process.exit(1);
+});

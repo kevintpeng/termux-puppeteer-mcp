@@ -1,0 +1,16 @@
+{
+  "name": "termux-puppeteer-mcp",
+  "version": "1.0.0",
+  "description": "Puppeteer MCP server for Termux using Alpine Linux",
+  "main": "index.js",
+  "type": "module",
+  "bin": {
+    "termux-puppeteer-mcp": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4"
+  }
+}
