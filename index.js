@@ -70,7 +70,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'puppeteer_screenshot',
-        description: 'Take a screenshot of a URL and return it as base64 JPEG (compressed to fit token limit)',
+        description: 'Take a screenshot of a URL and return it as base64 JPEG. Accepts any viewport dimensions and automatically scales down to fit 800x600 while preserving aspect ratio.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -80,12 +80,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             width: {
               type: 'number',
-              description: 'Viewport width (max 800)',
+              description: 'Viewport width in pixels',
               default: 800,
             },
             height: {
               type: 'number',
-              description: 'Viewport height (max 600)',
+              description: 'Viewport height in pixels',
               default: 600,
             },
           },
