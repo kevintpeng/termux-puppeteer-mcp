@@ -8,7 +8,9 @@
     "termux-puppeteer-mcp": "./index.js"
   },
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node test-converter.js",
+    "test:all": "node test-converter.js && node test-mcp.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4"

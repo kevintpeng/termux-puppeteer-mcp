@@ -151,10 +151,49 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
+// Helper to convert localhost URLs to file:// URLs when running locally
+function maybeConvertToFileUrl(url) {
+  // If it's a localhost URL pointing to a local server, we need to handle it differently
+  // since Alpine proot can't access Termux's localhost ports
+  const localhostPattern = /^https?:\/\/(localhost|127\.0\.0\.1):(\d+)(\/.*)?$/;
+  const match = url.match(localhostPattern);
+
+  if (match) {
+    const port = match[2];
+    const path = match[3] || '/';
+
+    // Check if we're serving from current directory
+    // Get the current working directory from Termux
+    try {
+      const cwd = execSync('pwd', { encoding: 'utf8' }).trim();
+
+      // If path is just '/' or '/index.html', convert to file:// URL
+      if (path === '/' || path === '/index.html') {
+        const filePath = join(cwd, 'index.html');
+        return `file://${filePath}`;
+      } else if (!path.includes('..')) {
+        // For other paths, try to resolve them
+        const filePath = join(cwd, path.substring(1)); // Remove leading /
+        return `file://${filePath}`;
+      }
+    } catch (e) {
+      // If we can't convert, return original URL and let it fail with helpful error
+      return url;
+    }
+  }
+
+  return url;
+}
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   try {
+    // Convert localhost URLs to file:// URLs when appropriate
+    if (args.url) {
+      args.url = maybeConvertToFileUrl(args.url);
+    }
+
     switch (name) {
       case 'puppeteer_navigate': {
         const code = `
@@ -257,7 +296,7 @@ const puppeteer = require('puppeteer');
   });
   const page = await browser.newPage();
   await page.goto('${args.url}', { waitUntil: 'networkidle2' });
-  const result = await page.evaluate(() => {
+  const result = await page.evaluate(async () => {
     ${escapedScript}
   });
   console.log(JSON.stringify({ result }));
