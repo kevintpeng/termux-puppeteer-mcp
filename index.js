@@ -9,6 +9,7 @@ import {
 import { execSync } from 'child_process';
 import { writeFileSync, readFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
+import { tmpdir } from 'os';
 
 const server = new Server(
   {
@@ -88,6 +89,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description: 'Viewport height in pixels',
               default: 600,
             },
+            delay: {
+              type: 'number',
+              description: 'Additional delay in milliseconds to wait after page load (for animations)',
+              default: 0,
+            },
+            waitUntil: {
+              type: 'string',
+              description: 'When to consider navigation finished: load, domcontentloaded, networkidle0, or networkidle2',
+              default: 'networkidle2',
+            },
+            waitForSelector: {
+              type: 'string',
+              description: 'CSS selector to wait for before taking screenshot',
+            },
           },
           required: ['url'],
         },
@@ -145,6 +160,48 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ['url', 'selector'],
+        },
+      },
+      {
+        name: 'puppeteer_screenshot_debug',
+        description: 'Take a screenshot and save it to a file, then open it with termux-open for debugging',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            url: {
+              type: 'string',
+              description: 'The URL to screenshot',
+            },
+            width: {
+              type: 'number',
+              description: 'Viewport width in pixels',
+              default: 800,
+            },
+            height: {
+              type: 'number',
+              description: 'Viewport height in pixels',
+              default: 600,
+            },
+            filename: {
+              type: 'string',
+              description: 'Output filename (defaults to screenshot-{timestamp}.jpg)',
+            },
+            delay: {
+              type: 'number',
+              description: 'Additional delay in milliseconds to wait after page load (for animations)',
+              default: 0,
+            },
+            waitUntil: {
+              type: 'string',
+              description: 'When to consider navigation finished: load, domcontentloaded, networkidle0, or networkidle2',
+              default: 'networkidle2',
+            },
+            waitForSelector: {
+              type: 'string',
+              description: 'CSS selector to wait for before taking screenshot',
+            },
+          },
+          required: ['url'],
         },
       },
     ],
@@ -228,6 +285,9 @@ const puppeteer = require('puppeteer');
         // Allow any viewport size, but scale down afterwards to stay under token limit
         const width = args.width || 800;
         const height = args.height || 600;
+        const delay = args.delay || 0;
+        const waitUntil = args.waitUntil || 'networkidle2';
+        const waitForSelector = args.waitForSelector || '';
         const code = `
 const puppeteer = require('puppeteer');
 const sharp = require('sharp');
@@ -239,7 +299,9 @@ const sharp = require('sharp');
   });
   const page = await browser.newPage();
   await page.setViewport({ width: ${width}, height: ${height} });
-  await page.goto('${args.url}', { waitUntil: 'networkidle2' });
+  await page.goto('${args.url}', { waitUntil: '${waitUntil}' });
+  ${waitForSelector ? `await page.waitForSelector('${waitForSelector.replace(/'/g, "\\'")}', { timeout: 10000 });` : ''}
+  ${delay > 0 ? `await new Promise(resolve => setTimeout(resolve, ${delay}));` : ''}
   const screenshotBuffer = await page.screenshot({
     type: 'png',
     fullPage: false
@@ -310,6 +372,7 @@ const puppeteer = require('puppeteer');
       }
 
       case 'puppeteer_click': {
+        const escapedSelector = args.selector.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
         const code = `
 const puppeteer = require('puppeteer');
 (async () => {
@@ -323,10 +386,10 @@ const puppeteer = require('puppeteer');
   ${args.waitForNavigation ? `
   await Promise.all([
     page.waitForNavigation({ waitUntil: 'networkidle2' }),
-    page.click('${args.selector}')
+    page.click('${escapedSelector}')
   ]);
   ` : `
-  await page.click('${args.selector}');
+  await page.click('${escapedSelector}');
   `}
   const newUrl = page.url();
   const title = await page.title();
@@ -337,6 +400,62 @@ const puppeteer = require('puppeteer');
         const result = runInAlpine(code);
         return {
           content: [{ type: 'text', text: result }],
+        };
+      }
+
+      case 'puppeteer_screenshot_debug': {
+        const width = args.width || 800;
+        const height = args.height || 600;
+        const filename = args.filename || `screenshot-${Date.now()}.jpg`;
+        const delay = args.delay || 0;
+        const waitUntil = args.waitUntil || 'networkidle2';
+        const waitForSelector = args.waitForSelector || '';
+
+        const code = `
+const puppeteer = require('puppeteer');
+const sharp = require('sharp');
+(async () => {
+  const browser = await puppeteer.launch({
+    executablePath: '/usr/bin/chromium-browser',
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    headless: true
+  });
+  const page = await browser.newPage();
+  await page.setViewport({ width: ${width}, height: ${height} });
+  await page.goto('${args.url}', { waitUntil: '${waitUntil}' });
+  ${waitForSelector ? `await page.waitForSelector('${waitForSelector.replace(/'/g, "\\'")}', { timeout: 10000 });` : ''}
+  ${delay > 0 ? `await new Promise(resolve => setTimeout(resolve, ${delay}));` : ''}
+  const screenshotBuffer = await page.screenshot({
+    type: 'png',
+    fullPage: false
+  });
+
+  // Convert to JPEG for better compatibility
+  const jpeg = await sharp(screenshotBuffer)
+    .jpeg({ quality: 80 })
+    .toBuffer();
+
+  const screenshot = jpeg.toString('base64');
+  console.log(JSON.stringify({ screenshot }));
+  await browser.close();
+})();
+`;
+        const result = runInAlpine(code);
+        const data = JSON.parse(result);
+
+        // Write screenshot to temp directory
+        const filepath = join(tmpdir(), filename);
+        writeFileSync(filepath, Buffer.from(data.screenshot, 'base64'));
+
+        // Open with termux-open
+        try {
+          execSync(`termux-open "${filepath}"`, { encoding: 'utf8' });
+        } catch (error) {
+          // termux-open might not return output, so ignore errors here
+        }
+
+        return {
+          content: [{ type: 'text', text: `Screenshot saved to ${filepath} and opened in Android viewer` }],
         };
       }
 
