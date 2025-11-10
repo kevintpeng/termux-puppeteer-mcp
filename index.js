@@ -64,6 +64,56 @@ function escapeShellArg(arg) {
 }
 
 /**
+ * Format diagnostics for user-friendly display
+ */
+function formatDiagnostics(diagnostics) {
+  if (!diagnostics) return '';
+
+  const { consoleLogs, pageErrors, networkErrors, counts } = diagnostics;
+
+  // If no diagnostics, return nothing
+  if (counts.console === 0 && counts.errors === 0 && counts.network === 0) {
+    return '';
+  }
+
+  let output = '\n\n## Browser Diagnostics\n';
+
+  // Console logs
+  if (consoleLogs && consoleLogs.length > 0) {
+    output += '\n### Console Messages:\n';
+    consoleLogs.forEach(log => {
+      const icon = log.type === 'error' ? '❌' : log.type === 'warn' ? '⚠️' : 'ℹ️';
+      output += `${icon} [${log.type}] ${log.text}\n`;
+    });
+  }
+
+  // Page errors
+  if (pageErrors && pageErrors.length > 0) {
+    output += '\n### Page Errors:\n';
+    pageErrors.forEach(err => {
+      output += `❌ ${err.message}\n`;
+      if (err.stack) {
+        output += `   Stack: ${err.stack.split('\n')[0]}\n`;
+      }
+    });
+  }
+
+  // Network errors
+  if (networkErrors && networkErrors.length > 0) {
+    output += '\n### Network Issues:\n';
+    networkErrors.forEach(err => {
+      if (err.status) {
+        output += `🌐 ${err.method} ${err.url} - ${err.status} ${err.statusText}\n`;
+      } else {
+        output += `🌐 ${err.method} ${err.url} - ${err.errorText}\n`;
+      }
+    });
+  }
+
+  return output;
+}
+
+/**
  * Helper to convert localhost URLs to file:// URLs
  */
 function maybeConvertToFileUrl(url) {
@@ -461,17 +511,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           browserServerRequest('DELETE', `/session/${activeSessionId}`);
         }
 
+        const diagnosticsText = formatDiagnostics(contentResp.diagnostics);
+
         return {
           content: [{
             type: 'text',
-            text: JSON.stringify({
-              success: true,
-              title: contentResp.title,
-              url: contentResp.url,
-              contentLength: contentResp.contentLength,
-              content: contentResp.content,
-              sessionId: tempSession ? undefined : activeSessionId,
-            }, null, 2)
+            text: `Navigation successful!\n\nTitle: ${contentResp.title}\nURL: ${contentResp.url}\nContent length: ${contentResp.contentLength} characters${tempSession ? '' : `\nSession ID: ${activeSessionId}`}${diagnosticsText}`
           }],
         };
       }
@@ -498,17 +543,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
+        const diagnosticsText = formatDiagnostics(response.diagnostics);
+
         return {
           content: [{
             type: 'text',
-            text: JSON.stringify({
-              success: true,
-              newUrl: response.newUrl,
-              title: response.title,
-              selector: args.selector,
-              sessionId: args.sessionId,
-              message: `Clicked element: ${args.selector}`,
-            }, null, 2)
+            text: `Clicked element: ${args.selector}\n\nNew URL: ${response.newUrl}\nTitle: ${response.title}\nSession ID: ${args.sessionId}${diagnosticsText}`
           }],
         };
       }
@@ -597,6 +637,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
+        const diagnosticsText = formatDiagnostics(response.diagnostics);
+
         return {
           content: [{
             type: 'text',
@@ -606,7 +648,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               url: response.url,
               title: response.title,
               sessionId: tempSession ? undefined : activeSessionId,
-            }, null, 2)
+            }, null, 2) + diagnosticsText
           }],
         };
       }
@@ -733,14 +775,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
+        const diagnosticsText = formatDiagnostics(response.diagnostics);
+
         return {
           content: [{
             type: 'text',
-            text: JSON.stringify({
-              success: true,
-              result: response.result,
-              sessionId: args.sessionId,
-            }, null, 2)
+            text: `Script evaluation successful!\n\nResult: ${JSON.stringify(response.result, null, 2)}\nSession ID: ${args.sessionId}${diagnosticsText}`
           }],
         };
       }
@@ -763,17 +803,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
+        const diagnosticsText = formatDiagnostics(response.diagnostics);
+
         return {
           content: [{
             type: 'text',
-            text: JSON.stringify({
-              success: true,
-              title: response.title,
-              url: response.url,
-              contentLength: response.contentLength,
-              content: response.content,
-              sessionId: args.sessionId,
-            }, null, 2)
+            text: `Page content retrieved!\n\nTitle: ${response.title}\nURL: ${response.url}\nContent length: ${response.contentLength} characters\nSession ID: ${args.sessionId}\n\nContent (first 10000 chars):\n${response.content}${diagnosticsText}`
           }],
         };
       }

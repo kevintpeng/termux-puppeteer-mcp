@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Test Page with Errors</title>
+</head>
+<body>
+    <h1>Test Page for Browser Diagnostics</h1>
+    <p>This page intentionally contains various errors for testing.</p>
+
+    <script>
+        // Console messages
+        console.log('This is a regular log message');
+        console.warn('This is a warning message');
+        console.error('This is an error message');
+        console.info('This is an info message');
+
+        // Uncaught error
+        setTimeout(() => {
+            throw new Error('This is an uncaught page error!');
+        }, 100);
+
+        // Try to load a non-existent resource
+        fetch('/non-existent-resource.json')
+            .then(res => res.json())
+            .catch(err => console.error('Fetch failed:', err.message));
+
+        // Reference error
+        setTimeout(() => {
+            try {
+                nonExistentFunction();
+            } catch (e) {
+                console.error('Reference error:', e.message);
+            }
+        }, 200);
+    </script>
+</body>
+</html>

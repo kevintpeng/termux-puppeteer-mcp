@@ -45,6 +45,9 @@ const sessions = new Map();
  * @property {number} lastAccessed - Timestamp of last activity
  * @property {string} currentUrl - Current URL (for stateless fallback)
  * @property {Object} metadata - Custom metadata (agent ID, etc.)
+ * @property {Array} consoleLogs - Console messages from the browser
+ * @property {Array} pageErrors - Uncaught page errors
+ * @property {Array} networkErrors - Failed network requests
  */
 
 // Browser launch configuration
@@ -94,6 +97,9 @@ async function createSession(metadata = {}) {
     lastAccessed: Date.now(),
     currentUrl: null,
     metadata: metadata || {},
+    consoleLogs: [],
+    pageErrors: [],
+    networkErrors: [],
   };
 
   sessions.set(sessionId, sessionData);
@@ -119,18 +125,90 @@ function getSession(sessionId) {
 }
 
 /**
+ * Attach diagnostic event listeners to a page
+ */
+function attachDiagnostics(page, session) {
+  // Capture console messages
+  page.on('console', msg => {
+    session.consoleLogs.push({
+      type: msg.type(), // 'log', 'warn', 'error', 'info', 'debug'
+      text: msg.text(),
+      timestamp: Date.now(),
+    });
+  });
+
+  // Capture page errors (uncaught exceptions)
+  page.on('pageerror', error => {
+    session.pageErrors.push({
+      message: error.message,
+      stack: error.stack,
+      timestamp: Date.now(),
+    });
+  });
+
+  // Capture failed network requests
+  page.on('requestfailed', request => {
+    session.networkErrors.push({
+      url: request.url(),
+      method: request.method(),
+      errorText: request.failure().errorText,
+      timestamp: Date.now(),
+    });
+  });
+
+  // Capture response errors (4xx, 5xx)
+  page.on('response', response => {
+    const status = response.status();
+    if (status >= 400) {
+      session.networkErrors.push({
+        url: response.url(),
+        method: response.request().method(),
+        status: status,
+        statusText: response.statusText(),
+        timestamp: Date.now(),
+      });
+    }
+  });
+}
+
+/**
  * Get or create the current page for a session
  */
 async function getCurrentPage(session) {
   // If no pages exist, create one
   if (session.pages.length === 0) {
     const page = await session.browser.newPage();
+    attachDiagnostics(page, session);
     session.pages.push(page);
     return page;
   }
 
   // Return the most recently used page
   return session.pages[session.pages.length - 1];
+}
+
+/**
+ * Get diagnostics for a session and optionally clear them
+ */
+function getDiagnostics(session, clear = false) {
+  const diagnostics = {
+    consoleLogs: session.consoleLogs,
+    pageErrors: session.pageErrors,
+    networkErrors: session.networkErrors,
+    counts: {
+      console: session.consoleLogs.length,
+      errors: session.pageErrors.length,
+      network: session.networkErrors.length,
+    },
+  };
+
+  if (clear) {
+    session.consoleLogs = [];
+    session.pageErrors = [];
+    session.networkErrors = [];
+  }
+
+  return diagnostics;
 }
 
 /**
@@ -261,6 +339,11 @@ app.post('/session/:id/navigate', async (req, res) => {
     const session = getSession(req.params.id);
     const { url, waitUntil = 'networkidle2' } = req.body;
 
+    // Clear diagnostics before navigation
+    session.consoleLogs = [];
+    session.pageErrors = [];
+    session.networkErrors = [];
+
     const page = await getCurrentPage(session);
     await page.setViewport({ width: 800, height: 600 });
     await page.goto(url, { waitUntil });
@@ -269,11 +352,13 @@ app.post('/session/:id/navigate', async (req, res) => {
 
     const title = await page.title();
     const pageUrl = page.url();
+    const diagnostics = getDiagnostics(session, false);
 
     res.json({
       success: true,
       title,
       url: pageUrl,
+      diagnostics,
     });
   } catch (error) {
     res.status(500).json({
@@ -293,6 +378,11 @@ app.post('/session/:id/click', async (req, res) => {
     const session = getSession(req.params.id);
     const { selector, waitForNavigation = false } = req.body;
 
+    // Clear diagnostics before click
+    session.consoleLogs = [];
+    session.pageErrors = [];
+    session.networkErrors = [];
+
     const page = await getCurrentPage(session);
 
     if (waitForNavigation) {
@@ -307,11 +397,13 @@ app.post('/session/:id/click', async (req, res) => {
     const newUrl = page.url();
     const title = await page.title();
     session.currentUrl = newUrl;
+    const diagnostics = getDiagnostics(session, false);
 
     res.json({
       success: true,
       newUrl,
       title,
+      diagnostics,
     });
   } catch (error) {
     res.status(500).json({
@@ -359,12 +451,14 @@ app.post('/session/:id/screenshot', async (req, res) => {
       .toBuffer();
 
     const screenshot = resized.toString('base64');
+    const diagnostics = getDiagnostics(session, false);
 
     res.json({
       success: true,
       screenshot,
       url: page.url(),
       title: await page.title(),
+      diagnostics,
     });
   } catch (error) {
     res.status(500).json({
@@ -384,6 +478,11 @@ app.post('/session/:id/evaluate', async (req, res) => {
     const session = getSession(req.params.id);
     const { script } = req.body;
 
+    // Clear diagnostics before evaluation
+    session.consoleLogs = [];
+    session.pageErrors = [];
+    session.networkErrors = [];
+
     const page = await getCurrentPage(session);
 
     // Evaluate the script in the page context
@@ -393,9 +492,12 @@ app.post('/session/:id/evaluate', async (req, res) => {
       return fn();
     }, script);
 
+    const diagnostics = getDiagnostics(session, false);
+
     res.json({
       success: true,
       result,
+      diagnostics,
     });
   } catch (error) {
     res.status(500).json({
@@ -417,6 +519,7 @@ app.get('/session/:id/content', async (req, res) => {
     const content = await page.content();
     const title = await page.title();
     const url = page.url();
+    const diagnostics = getDiagnostics(session, false);
 
     res.json({
       success: true,
@@ -424,9 +527,33 @@ app.get('/session/:id/content', async (req, res) => {
       url,
       content: content.substring(0, 10000), // Limit content size
       contentLength: content.length,
+      diagnostics,
     });
   } catch (error) {
     res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+/**
+ * Get diagnostics (console logs, errors, network issues)
+ * GET /session/:id/diagnostics?clear=true
+ */
+app.get('/session/:id/diagnostics', (req, res) => {
+  try {
+    const session = getSession(req.params.id);
+    const clear = req.query.clear === 'true';
+
+    const diagnostics = getDiagnostics(session, clear);
+
+    res.json({
+      success: true,
+      diagnostics,
+    });
+  } catch (error) {
+    res.status(404).json({
       success: false,
       error: error.message,
     });
