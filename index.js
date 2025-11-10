@@ -310,11 +310,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           metadata: args.metadata || {},
         });
 
+        if (!response.success) {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                error: response.error || 'Unknown error',
+                message: `Failed to create session: ${response.error || 'Unknown error'}`,
+              }, null, 2)
+            }],
+            isError: true,
+          };
+        }
+
         return {
           content: [{
             type: 'text',
             text: JSON.stringify({
-              success: response.success,
+              success: true,
               sessionId: response.sessionId,
               message: `Session created: ${response.sessionId}. Use this ID in subsequent calls to maintain state.`,
             }, null, 2)
@@ -325,11 +339,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'close_session': {
         const response = browserServerRequest('DELETE', `/session/${args.sessionId}`);
 
+        if (!response.success) {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                error: response.error || 'Unknown error',
+                sessionId: args.sessionId,
+                message: `Failed to close session ${args.sessionId}: ${response.error || 'Unknown error'}`,
+              }, null, 2)
+            }],
+            isError: true,
+          };
+        }
+
         return {
           content: [{
             type: 'text',
             text: JSON.stringify({
-              success: response.success,
+              success: true,
+              sessionId: args.sessionId,
               message: `Session ${args.sessionId} closed successfully`,
             }, null, 2)
           }],
@@ -358,6 +388,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const createResp = browserServerRequest('POST', '/session/create', {
             metadata: { temporary: true },
           });
+
+          if (!createResp.success) {
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  success: false,
+                  error: createResp.error || 'Unknown error',
+                  message: `Failed to create temporary session: ${createResp.error || 'Unknown error'}`,
+                }, null, 2)
+              }],
+              isError: true,
+            };
+          }
+
           activeSessionId = createResp.sessionId;
         }
 
@@ -367,8 +412,49 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           waitUntil: args.waitUntil || 'networkidle2',
         });
 
+        if (!response.success) {
+          // Close temp session on error
+          if (tempSession) {
+            browserServerRequest('DELETE', `/session/${activeSessionId}`);
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                error: response.error || 'Unknown error',
+                url: args.url,
+                sessionId: tempSession ? undefined : activeSessionId,
+                message: `Failed to navigate to ${args.url}: ${response.error || 'Unknown error'}`,
+              }, null, 2)
+            }],
+            isError: true,
+          };
+        }
+
         // Get content
         const contentResp = browserServerRequest('GET', `/session/${activeSessionId}/content`);
+
+        if (!contentResp.success) {
+          // Close temp session on error
+          if (tempSession) {
+            browserServerRequest('DELETE', `/session/${activeSessionId}`);
+          }
+
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                error: contentResp.error || 'Unknown error',
+                sessionId: tempSession ? undefined : activeSessionId,
+                message: `Failed to get page content: ${contentResp.error || 'Unknown error'}`,
+              }, null, 2)
+            }],
+            isError: true,
+          };
+        }
 
         // Close temp session
         if (tempSession) {
@@ -379,7 +465,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [{
             type: 'text',
             text: JSON.stringify({
-              success: response.success,
+              success: true,
               title: contentResp.title,
               url: contentResp.url,
               contentLength: contentResp.contentLength,
@@ -396,13 +482,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           waitForNavigation: args.waitForNavigation || false,
         });
 
+        if (!response.success) {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                error: response.error || 'Unknown error',
+                selector: args.selector,
+                sessionId: args.sessionId,
+                message: `Failed to click element "${args.selector}": ${response.error || 'Unknown error'}`,
+              }, null, 2)
+            }],
+            isError: true,
+          };
+        }
+
         return {
           content: [{
             type: 'text',
             text: JSON.stringify({
-              success: response.success,
+              success: true,
               newUrl: response.newUrl,
               title: response.title,
+              selector: args.selector,
+              sessionId: args.sessionId,
               message: `Clicked element: ${args.selector}`,
             }, null, 2)
           }],
@@ -423,13 +527,46 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const createResp = browserServerRequest('POST', '/session/create', {
             metadata: { temporary: true },
           });
+
+          if (!createResp.success) {
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  success: false,
+                  error: createResp.error || 'Unknown error',
+                  message: `Failed to create temporary session: ${createResp.error || 'Unknown error'}`,
+                }, null, 2)
+              }],
+              isError: true,
+            };
+          }
+
           activeSessionId = createResp.sessionId;
 
           // Navigate to URL
-          await browserServerRequest('POST', `/session/${activeSessionId}/navigate`, {
+          const navResp = await browserServerRequest('POST', `/session/${activeSessionId}/navigate`, {
             url: args.url,
             waitUntil: 'networkidle2',
           });
+
+          if (!navResp.success) {
+            // Close temp session on error
+            browserServerRequest('DELETE', `/session/${activeSessionId}`);
+
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  success: false,
+                  error: navResp.error || 'Unknown error',
+                  url: args.url,
+                  message: `Failed to navigate to ${args.url}: ${navResp.error || 'Unknown error'}`,
+                }, null, 2)
+              }],
+              isError: true,
+            };
+          }
         }
 
         // Take screenshot
@@ -445,14 +582,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           browserServerRequest('DELETE', `/session/${activeSessionId}`);
         }
 
+        if (!response.success) {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                error: response.error || 'Unknown error',
+                sessionId: tempSession ? undefined : activeSessionId,
+                message: `Failed to take screenshot: ${response.error || 'Unknown error'}`,
+              }, null, 2)
+            }],
+            isError: true,
+          };
+        }
+
         return {
           content: [{
             type: 'text',
             text: JSON.stringify({
-              success: response.success,
+              success: true,
               screenshot: response.screenshot,
               url: response.url,
               title: response.title,
+              sessionId: tempSession ? undefined : activeSessionId,
             }, null, 2)
           }],
         };
@@ -472,12 +625,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const createResp = browserServerRequest('POST', '/session/create', {
             metadata: { temporary: true },
           });
+
+          if (!createResp.success) {
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  success: false,
+                  error: createResp.error || 'Unknown error',
+                  message: `Failed to create temporary session: ${createResp.error || 'Unknown error'}`,
+                }, null, 2)
+              }],
+              isError: true,
+            };
+          }
+
           activeSessionId = createResp.sessionId;
 
-          await browserServerRequest('POST', `/session/${activeSessionId}/navigate`, {
+          const navResp = await browserServerRequest('POST', `/session/${activeSessionId}/navigate`, {
             url: args.url,
             waitUntil: 'networkidle2',
           });
+
+          if (!navResp.success) {
+            // Close temp session on error
+            browserServerRequest('DELETE', `/session/${activeSessionId}`);
+
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  success: false,
+                  error: navResp.error || 'Unknown error',
+                  url: args.url,
+                  message: `Failed to navigate to ${args.url}: ${navResp.error || 'Unknown error'}`,
+                }, null, 2)
+              }],
+              isError: true,
+            };
+          }
         }
 
         // Take screenshot
@@ -490,6 +676,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Close temp session
         if (tempSession) {
           browserServerRequest('DELETE', `/session/${activeSessionId}`);
+        }
+
+        if (!response.success) {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                error: response.error || 'Unknown error',
+                sessionId: tempSession ? undefined : activeSessionId,
+                message: `Failed to take screenshot: ${response.error || 'Unknown error'}`,
+              }, null, 2)
+            }],
+            isError: true,
+          };
         }
 
         // Save screenshot to file
@@ -517,12 +718,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           script: args.script,
         });
 
+        if (!response.success) {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                error: response.error || 'Unknown error',
+                sessionId: args.sessionId,
+                message: `Failed to evaluate script: ${response.error || 'Unknown error'}`,
+              }, null, 2)
+            }],
+            isError: true,
+          };
+        }
+
         return {
           content: [{
             type: 'text',
             text: JSON.stringify({
-              success: response.success,
+              success: true,
               result: response.result,
+              sessionId: args.sessionId,
             }, null, 2)
           }],
         };
@@ -531,15 +748,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'get_page_content': {
         const response = browserServerRequest('GET', `/session/${args.sessionId}/content`);
 
+        if (!response.success) {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                error: response.error || 'Unknown error',
+                sessionId: args.sessionId,
+                message: `Failed to get page content: ${response.error || 'Unknown error'}`,
+              }, null, 2)
+            }],
+            isError: true,
+          };
+        }
+
         return {
           content: [{
             type: 'text',
             text: JSON.stringify({
-              success: response.success,
+              success: true,
               title: response.title,
               url: response.url,
               contentLength: response.contentLength,
               content: response.content,
+              sessionId: args.sessionId,
             }, null, 2)
           }],
         };
