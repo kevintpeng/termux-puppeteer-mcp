@@ -1,5 +1,11 @@
 #!/usr/bin/env node
 
+/**
+ * Termux Puppeteer MCP Server v2
+ * Session-based architecture with multi-agent support
+ * Communicates with persistent browser server in Alpine
+ */
+
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -14,7 +20,7 @@ import { tmpdir } from 'os';
 const server = new Server(
   {
     name: 'termux-puppeteer-mcp',
-    version: '1.0.0',
+    version: '2.0.0',
   },
   {
     capabilities: {
@@ -23,36 +29,114 @@ const server = new Server(
   }
 );
 
-// Helper function to execute code in Alpine with Puppeteer
-function runInAlpine(code) {
-  const scriptPath = `/root/mcp-script-${Date.now()}.js`;
-  const tempLocalScript = join('/data/data/com.termux/files/home', `temp-${Date.now()}.js`);
+const BROWSER_SERVER_URL = 'http://127.0.0.1:3000';
 
-  // Write the script locally first
-  writeFileSync(tempLocalScript, code);
+/**
+ * Make HTTP request to browser server in Alpine
+ */
+function browserServerRequest(method, path, body = null) {
+  let curlCmd;
+
+  if (method === 'GET') {
+    curlCmd = `curl -s -X GET "${BROWSER_SERVER_URL}${path}"`;
+  } else if (body === null || body === undefined) {
+    // Don't include -d flag for DELETE or other methods without a body
+    curlCmd = `curl -s -X ${method} "${BROWSER_SERVER_URL}${path}"`;
+  } else {
+    curlCmd = `curl -s -X ${method} -H "Content-Type: application/json" -d ${escapeShellArg(JSON.stringify(body))} "${BROWSER_SERVER_URL}${path}"`;
+  }
 
   try {
-    // Copy script to Alpine and execute
     const result = execSync(
-      `proot-distro login alpine -- sh -c "cat > ${scriptPath} << 'EOFSCRIPT'\n${code}\nEOFSCRIPT\nnode ${scriptPath} && rm ${scriptPath}"`,
+      `proot-distro login alpine -- sh -c ${escapeShellArg(curlCmd)} 2>/dev/null`,
       { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }
     );
 
-    unlinkSync(tempLocalScript);
-    return result;
+    return JSON.parse(result);
   } catch (error) {
-    unlinkSync(tempLocalScript);
-    throw new Error(`Alpine execution failed: ${error.message}\nStderr: ${error.stderr}`);
+    throw new Error(`Browser server request failed: ${error.message}`);
   }
 }
 
-// Define Puppeteer tools
+function escapeShellArg(arg) {
+  // Escape for shell by wrapping in single quotes and escaping any single quotes
+  return "'" + arg.replace(/'/g, "'\\''") + "'";
+}
+
+/**
+ * Helper to convert localhost URLs to file:// URLs
+ */
+function maybeConvertToFileUrl(url) {
+  const localhostPattern = /^https?:\/\/(localhost|127\.0\.0\.1):(\d+)(\/.*)?$/;
+  const match = url.match(localhostPattern);
+
+  if (match) {
+    const pathWithQuery = match[3] || '/';
+    const [path, queryString] = pathWithQuery.split('?');
+
+    try {
+      const cwd = execSync('pwd', { encoding: 'utf8' }).trim();
+
+      if (path === '/' || path === '/index.html') {
+        const filePath = join(cwd, 'index.html');
+        return queryString ? `file://${filePath}?${queryString}` : `file://${filePath}`;
+      } else if (!path.includes('..')) {
+        const filePath = join(cwd, path.substring(1));
+        return queryString ? `file://${filePath}?${queryString}` : `file://${filePath}`;
+      }
+    } catch (e) {
+      return url;
+    }
+  }
+
+  return url;
+}
+
+// Define tools
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
+      // Session management
+      {
+        name: 'create_session',
+        description: 'Create a new browser session for multi-step workflows. Returns a sessionId that persists state between calls. Sessions auto-expire after 5 minutes of inactivity.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            metadata: {
+              type: 'object',
+              description: 'Optional metadata to attach to the session (e.g., agentId, purpose)',
+            },
+          },
+        },
+      },
+      {
+        name: 'close_session',
+        description: 'Close a browser session and free up resources. Sessions auto-close after timeout, but explicit closing is recommended.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sessionId: {
+              type: 'string',
+              description: 'The session ID to close',
+            },
+          },
+          required: ['sessionId'],
+        },
+      },
+      {
+        name: 'list_sessions',
+        description: 'List all active browser sessions with their status',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+        },
+      },
+
+      // Browser actions (session-aware)
       {
         name: 'puppeteer_navigate',
-        description: 'Navigate to a URL and get the page content, title, and optionally take a screenshot',
+        description: 'Navigate to a URL and get the page content/title. If sessionId provided, uses existing session. Otherwise creates a temporary session.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -60,24 +144,55 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: 'string',
               description: 'The URL to navigate to',
             },
-            screenshot: {
-              type: 'boolean',
-              description: 'Whether to take a screenshot (returns base64)',
-              default: false,
+            sessionId: {
+              type: 'string',
+              description: 'Optional session ID to use. If not provided, creates a temporary session.',
+            },
+            waitUntil: {
+              type: 'string',
+              description: 'When to consider navigation finished: load, domcontentloaded, networkidle0, or networkidle2',
+              default: 'networkidle2',
             },
           },
           required: ['url'],
         },
       },
       {
+        name: 'puppeteer_click',
+        description: 'Click an element on the current page. Requires sessionId to maintain state after navigation.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            selector: {
+              type: 'string',
+              description: 'CSS selector for the element to click',
+            },
+            sessionId: {
+              type: 'string',
+              description: 'Session ID (required for stateful operation)',
+            },
+            waitForNavigation: {
+              type: 'boolean',
+              description: 'Wait for navigation after click',
+              default: false,
+            },
+          },
+          required: ['selector', 'sessionId'],
+        },
+      },
+      {
         name: 'puppeteer_screenshot',
-        description: 'Take a screenshot of a URL and return it as base64 JPEG. Accepts any viewport dimensions and automatically scales down to fit 800x600 while preserving aspect ratio.',
+        description: 'Take a screenshot of the current page state and return as base64 JPEG. If sessionId provided, screenshots the current state. Otherwise navigates to URL first.',
         inputSchema: {
           type: 'object',
           properties: {
             url: {
               type: 'string',
-              description: 'The URL to screenshot',
+              description: 'URL to screenshot (only used if sessionId not provided)',
+            },
+            sessionId: {
+              type: 'string',
+              description: 'Session ID to screenshot current state',
             },
             width: {
               type: 'number',
@@ -91,86 +206,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             delay: {
               type: 'number',
-              description: 'Additional delay in milliseconds to wait after page load (for animations)',
+              description: 'Additional delay in milliseconds after page load',
               default: 0,
-            },
-            waitUntil: {
-              type: 'string',
-              description: 'When to consider navigation finished: load, domcontentloaded, networkidle0, or networkidle2',
-              default: 'networkidle2',
             },
             waitForSelector: {
               type: 'string',
               description: 'CSS selector to wait for before taking screenshot',
             },
           },
-          required: ['url'],
-        },
-      },
-      {
-        name: 'puppeteer_pdf',
-        description: 'Generate a PDF from a URL and return it as base64',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            url: {
-              type: 'string',
-              description: 'The URL to convert to PDF',
-            },
-          },
-          required: ['url'],
-        },
-      },
-      {
-        name: 'puppeteer_evaluate',
-        description: 'Execute JavaScript code in the context of a page and return the result',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            url: {
-              type: 'string',
-              description: 'The URL to navigate to',
-            },
-            script: {
-              type: 'string',
-              description: 'JavaScript code to execute in the page context',
-            },
-          },
-          required: ['url', 'script'],
-        },
-      },
-      {
-        name: 'puppeteer_click',
-        description: 'Navigate to a URL, click an element, and return the result',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            url: {
-              type: 'string',
-              description: 'The URL to navigate to',
-            },
-            selector: {
-              type: 'string',
-              description: 'CSS selector for the element to click',
-            },
-            waitForNavigation: {
-              type: 'boolean',
-              description: 'Wait for navigation after click',
-              default: false,
-            },
-          },
-          required: ['url', 'selector'],
         },
       },
       {
         name: 'puppeteer_screenshot_debug',
-        description: 'Take a screenshot and save it to a file, then open it with termux-open for debugging',
+        description: 'Take a screenshot and save it to a file, then open with termux-open for debugging. Works with sessionId to capture current state.',
         inputSchema: {
           type: 'object',
           properties: {
             url: {
               type: 'string',
-              description: 'The URL to screenshot',
+              description: 'URL to screenshot (only used if sessionId not provided)',
+            },
+            sessionId: {
+              type: 'string',
+              description: 'Session ID to screenshot current state',
             },
             width: {
               type: 'number',
@@ -188,274 +246,302 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             delay: {
               type: 'number',
-              description: 'Additional delay in milliseconds to wait after page load (for animations)',
+              description: 'Additional delay in milliseconds after page load',
               default: 0,
             },
-            waitUntil: {
+          },
+        },
+      },
+      {
+        name: 'puppeteer_evaluate',
+        description: 'Execute JavaScript in the page context and return the result. Requires sessionId.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            script: {
               type: 'string',
-              description: 'When to consider navigation finished: load, domcontentloaded, networkidle0, or networkidle2',
-              default: 'networkidle2',
+              description: 'JavaScript code to execute (can use return statement)',
             },
-            waitForSelector: {
+            sessionId: {
               type: 'string',
-              description: 'CSS selector to wait for before taking screenshot',
+              description: 'Session ID (required)',
             },
           },
-          required: ['url'],
+          required: ['script', 'sessionId'],
+        },
+      },
+      {
+        name: 'get_page_content',
+        description: 'Get the HTML content of the current page. Requires sessionId.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sessionId: {
+              type: 'string',
+              description: 'Session ID (required)',
+            },
+          },
+          required: ['sessionId'],
         },
       },
     ],
   };
 });
 
-// Helper to convert localhost URLs to file:// URLs when running locally
-function maybeConvertToFileUrl(url) {
-  // If it's a localhost URL pointing to a local server, we need to handle it differently
-  // since Alpine proot can't access Termux's localhost ports
-  const localhostPattern = /^https?:\/\/(localhost|127\.0\.0\.1):(\d+)(\/.*)?$/;
-  const match = url.match(localhostPattern);
-
-  if (match) {
-    const port = match[2];
-    const path = match[3] || '/';
-
-    // Check if we're serving from current directory
-    // Get the current working directory from Termux
-    try {
-      const cwd = execSync('pwd', { encoding: 'utf8' }).trim();
-
-      // If path is just '/' or '/index.html', convert to file:// URL
-      if (path === '/' || path === '/index.html') {
-        const filePath = join(cwd, 'index.html');
-        return `file://${filePath}`;
-      } else if (!path.includes('..')) {
-        // For other paths, try to resolve them
-        const filePath = join(cwd, path.substring(1)); // Remove leading /
-        return `file://${filePath}`;
-      }
-    } catch (e) {
-      // If we can't convert, return original URL and let it fail with helpful error
-      return url;
-    }
-  }
-
-  return url;
-}
-
+// Handle tool calls
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   try {
-    // Convert localhost URLs to file:// URLs when appropriate
+    // Convert localhost URLs
     if (args.url) {
       args.url = maybeConvertToFileUrl(args.url);
     }
 
     switch (name) {
+      // Session management
+      case 'create_session': {
+        // Ensure browser server is running before creating session
+        if (!ensureBrowserServer()) {
+          throw new Error('Failed to start browser server. Please start it manually: proot-distro login alpine -- sh -c "cd /root && node browser-server.js"');
+        }
+
+        const response = browserServerRequest('POST', '/session/create', {
+          metadata: args.metadata || {},
+        });
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: response.success,
+              sessionId: response.sessionId,
+              message: `Session created: ${response.sessionId}. Use this ID in subsequent calls to maintain state.`,
+            }, null, 2)
+          }],
+        };
+      }
+
+      case 'close_session': {
+        const response = browserServerRequest('DELETE', `/session/${args.sessionId}`);
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: response.success,
+              message: `Session ${args.sessionId} closed successfully`,
+            }, null, 2)
+          }],
+        };
+      }
+
+      case 'list_sessions': {
+        const response = browserServerRequest('GET', '/sessions');
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(response, null, 2)
+          }],
+        };
+      }
+
+      // Browser actions
       case 'puppeteer_navigate': {
-        const code = `
-const puppeteer = require('puppeteer');
-(async () => {
-  const browser = await puppeteer.launch({
-    executablePath: '/usr/bin/chromium-browser',
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-    headless: true
-  });
-  const page = await browser.newPage();
-  await page.setViewport({ width: 800, height: 600 });
-  await page.goto('${args.url}', { waitUntil: 'networkidle2' });
-  const title = await page.title();
-  const content = await page.content();
-  ${args.screenshot ? `
-  const screenshot = await page.screenshot({ encoding: 'base64', type: 'jpeg', quality: 60 });
-  console.log(JSON.stringify({ title, contentLength: content.length, screenshot }));
-  ` : `
-  console.log(JSON.stringify({ title, contentLength: content.length, content: content.substring(0, 5000) }));
-  `}
-  await browser.close();
-})();
-`;
-        const result = runInAlpine(code);
+        const sessionId = args.sessionId;
+        const tempSession = !sessionId;
+
+        // Create temp session if needed
+        let activeSessionId = sessionId;
+        if (tempSession) {
+          const createResp = browserServerRequest('POST', '/session/create', {
+            metadata: { temporary: true },
+          });
+          activeSessionId = createResp.sessionId;
+        }
+
+        // Navigate
+        const response = browserServerRequest('POST', `/session/${activeSessionId}/navigate`, {
+          url: args.url,
+          waitUntil: args.waitUntil || 'networkidle2',
+        });
+
+        // Get content
+        const contentResp = browserServerRequest('GET', `/session/${activeSessionId}/content`);
+
+        // Close temp session
+        if (tempSession) {
+          browserServerRequest('DELETE', `/session/${activeSessionId}`);
+        }
+
         return {
-          content: [{ type: 'text', text: result }],
-        };
-      }
-
-      case 'puppeteer_screenshot': {
-        // Allow any viewport size, but scale down afterwards to stay under token limit
-        const width = args.width || 800;
-        const height = args.height || 600;
-        const delay = args.delay || 0;
-        const waitUntil = args.waitUntil || 'networkidle2';
-        const waitForSelector = args.waitForSelector || '';
-        const code = `
-const puppeteer = require('puppeteer');
-const sharp = require('sharp');
-(async () => {
-  const browser = await puppeteer.launch({
-    executablePath: '/usr/bin/chromium-browser',
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-    headless: true
-  });
-  const page = await browser.newPage();
-  await page.setViewport({ width: ${width}, height: ${height} });
-  await page.goto('${args.url}', { waitUntil: '${waitUntil}' });
-  ${waitForSelector ? `await page.waitForSelector('${waitForSelector.replace(/'/g, "\\'")}', { timeout: 10000 });` : ''}
-  ${delay > 0 ? `await new Promise(resolve => setTimeout(resolve, ${delay}));` : ''}
-  const screenshotBuffer = await page.screenshot({
-    type: 'png',
-    fullPage: false
-  });
-
-  // Scale down to max 800x600 while preserving aspect ratio
-  const resized = await sharp(screenshotBuffer)
-    .resize(800, 600, { fit: 'inside', withoutEnlargement: true })
-    .jpeg({ quality: 60 })
-    .toBuffer();
-
-  const screenshot = resized.toString('base64');
-  console.log(JSON.stringify({ screenshot }));
-  await browser.close();
-})();
-`;
-        const result = runInAlpine(code);
-        return {
-          content: [{ type: 'text', text: result }],
-        };
-      }
-
-      case 'puppeteer_pdf': {
-        const code = `
-const puppeteer = require('puppeteer');
-(async () => {
-  const browser = await puppeteer.launch({
-    executablePath: '/usr/bin/chromium-browser',
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-    headless: true
-  });
-  const page = await browser.newPage();
-  await page.goto('${args.url}', { waitUntil: 'networkidle2' });
-  const pdf = await page.pdf({ format: 'A4' });
-  console.log(JSON.stringify({ pdf: pdf.toString('base64') }));
-  await browser.close();
-})();
-`;
-        const result = runInAlpine(code);
-        return {
-          content: [{ type: 'text', text: result }],
-        };
-      }
-
-      case 'puppeteer_evaluate': {
-        const escapedScript = args.script.replace(/`/g, '\\`').replace(/\$/g, '\\$');
-        const code = `
-const puppeteer = require('puppeteer');
-(async () => {
-  const browser = await puppeteer.launch({
-    executablePath: '/usr/bin/chromium-browser',
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-    headless: true
-  });
-  const page = await browser.newPage();
-  await page.goto('${args.url}', { waitUntil: 'networkidle2' });
-  const result = await page.evaluate(async () => {
-    ${escapedScript}
-  });
-  console.log(JSON.stringify({ result }));
-  await browser.close();
-})();
-`;
-        const result = runInAlpine(code);
-        return {
-          content: [{ type: 'text', text: result }],
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: response.success,
+              title: contentResp.title,
+              url: contentResp.url,
+              contentLength: contentResp.contentLength,
+              content: contentResp.content,
+              sessionId: tempSession ? undefined : activeSessionId,
+            }, null, 2)
+          }],
         };
       }
 
       case 'puppeteer_click': {
-        const escapedSelector = args.selector.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-        const code = `
-const puppeteer = require('puppeteer');
-(async () => {
-  const browser = await puppeteer.launch({
-    executablePath: '/usr/bin/chromium-browser',
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-    headless: true
-  });
-  const page = await browser.newPage();
-  await page.goto('${args.url}', { waitUntil: 'networkidle2' });
-  ${args.waitForNavigation ? `
-  await Promise.all([
-    page.waitForNavigation({ waitUntil: 'networkidle2' }),
-    page.click('${escapedSelector}')
-  ]);
-  ` : `
-  await page.click('${escapedSelector}');
-  `}
-  const newUrl = page.url();
-  const title = await page.title();
-  console.log(JSON.stringify({ success: true, newUrl, title }));
-  await browser.close();
-})();
-`;
-        const result = runInAlpine(code);
+        const response = browserServerRequest('POST', `/session/${args.sessionId}/click`, {
+          selector: args.selector,
+          waitForNavigation: args.waitForNavigation || false,
+        });
+
         return {
-          content: [{ type: 'text', text: result }],
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: response.success,
+              newUrl: response.newUrl,
+              title: response.title,
+              message: `Clicked element: ${args.selector}`,
+            }, null, 2)
+          }],
+        };
+      }
+
+      case 'puppeteer_screenshot': {
+        const sessionId = args.sessionId;
+        const tempSession = !sessionId;
+
+        // Create temp session and navigate if needed
+        let activeSessionId = sessionId;
+        if (tempSession) {
+          if (!args.url) {
+            throw new Error('url is required when sessionId is not provided');
+          }
+
+          const createResp = browserServerRequest('POST', '/session/create', {
+            metadata: { temporary: true },
+          });
+          activeSessionId = createResp.sessionId;
+
+          // Navigate to URL
+          await browserServerRequest('POST', `/session/${activeSessionId}/navigate`, {
+            url: args.url,
+            waitUntil: 'networkidle2',
+          });
+        }
+
+        // Take screenshot
+        const response = browserServerRequest('POST', `/session/${activeSessionId}/screenshot`, {
+          width: args.width || 800,
+          height: args.height || 600,
+          delay: args.delay || 0,
+          waitForSelector: args.waitForSelector,
+        });
+
+        // Close temp session
+        if (tempSession) {
+          browserServerRequest('DELETE', `/session/${activeSessionId}`);
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: response.success,
+              screenshot: response.screenshot,
+              url: response.url,
+              title: response.title,
+            }, null, 2)
+          }],
         };
       }
 
       case 'puppeteer_screenshot_debug': {
-        const width = args.width || 800;
-        const height = args.height || 600;
+        const sessionId = args.sessionId;
+        const tempSession = !sessionId;
+
+        // Create temp session and navigate if needed
+        let activeSessionId = sessionId;
+        if (tempSession) {
+          if (!args.url) {
+            throw new Error('url is required when sessionId is not provided');
+          }
+
+          const createResp = browserServerRequest('POST', '/session/create', {
+            metadata: { temporary: true },
+          });
+          activeSessionId = createResp.sessionId;
+
+          await browserServerRequest('POST', `/session/${activeSessionId}/navigate`, {
+            url: args.url,
+            waitUntil: 'networkidle2',
+          });
+        }
+
+        // Take screenshot
+        const response = browserServerRequest('POST', `/session/${activeSessionId}/screenshot`, {
+          width: args.width || 800,
+          height: args.height || 600,
+          delay: args.delay || 0,
+        });
+
+        // Close temp session
+        if (tempSession) {
+          browserServerRequest('DELETE', `/session/${activeSessionId}`);
+        }
+
+        // Save screenshot to file
         const filename = args.filename || `screenshot-${Date.now()}.jpg`;
-        const delay = args.delay || 0;
-        const waitUntil = args.waitUntil || 'networkidle2';
-        const waitForSelector = args.waitForSelector || '';
-
-        const code = `
-const puppeteer = require('puppeteer');
-const sharp = require('sharp');
-(async () => {
-  const browser = await puppeteer.launch({
-    executablePath: '/usr/bin/chromium-browser',
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-    headless: true
-  });
-  const page = await browser.newPage();
-  await page.setViewport({ width: ${width}, height: ${height} });
-  await page.goto('${args.url}', { waitUntil: '${waitUntil}' });
-  ${waitForSelector ? `await page.waitForSelector('${waitForSelector.replace(/'/g, "\\'")}', { timeout: 10000 });` : ''}
-  ${delay > 0 ? `await new Promise(resolve => setTimeout(resolve, ${delay}));` : ''}
-  const screenshotBuffer = await page.screenshot({
-    type: 'png',
-    fullPage: false
-  });
-
-  // Convert to JPEG for better compatibility
-  const jpeg = await sharp(screenshotBuffer)
-    .jpeg({ quality: 80 })
-    .toBuffer();
-
-  const screenshot = jpeg.toString('base64');
-  console.log(JSON.stringify({ screenshot }));
-  await browser.close();
-})();
-`;
-        const result = runInAlpine(code);
-        const data = JSON.parse(result);
-
-        // Write screenshot to temp directory
         const filepath = join(tmpdir(), filename);
-        writeFileSync(filepath, Buffer.from(data.screenshot, 'base64'));
+        writeFileSync(filepath, Buffer.from(response.screenshot, 'base64'));
 
         // Open with termux-open
         try {
           execSync(`termux-open "${filepath}"`, { encoding: 'utf8' });
         } catch (error) {
-          // termux-open might not return output, so ignore errors here
+          // termux-open might not return output
         }
 
         return {
-          content: [{ type: 'text', text: `Screenshot saved to ${filepath} and opened in Android viewer` }],
+          content: [{
+            type: 'text',
+            text: `Screenshot saved to ${filepath} and opened in Android viewer\n\nURL: ${response.url}\nTitle: ${response.title}`
+          }],
+        };
+      }
+
+      case 'puppeteer_evaluate': {
+        const response = browserServerRequest('POST', `/session/${args.sessionId}/evaluate`, {
+          script: args.script,
+        });
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: response.success,
+              result: response.result,
+            }, null, 2)
+          }],
+        };
+      }
+
+      case 'get_page_content': {
+        const response = browserServerRequest('GET', `/session/${args.sessionId}/content`);
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: response.success,
+              title: response.title,
+              url: response.url,
+              contentLength: response.contentLength,
+              content: response.content,
+            }, null, 2)
+          }],
         };
       }
 
@@ -470,11 +556,67 @@ const sharp = require('sharp');
   }
 });
 
+/**
+ * Check if browser server is running
+ */
+function isBrowserServerRunning() {
+  try {
+    const result = execSync(
+      `proot-distro login alpine -- sh -c ${escapeShellArg('curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3000/health')} 2>/dev/null`,
+      { encoding: 'utf8', timeout: 3000 }
+    ).trim();
+    return result === '200';
+  } catch (error) {
+    return false;
+  }
+}
+
+/**
+ * Start browser server - requires manual startup due to proot limitations
+ * Background processes in proot don't persist reliably
+ */
+function startBrowserServer() {
+  console.error('[MCP] ⚠️  Browser server auto-start is not available');
+  console.error('[MCP] Please start the browser server manually in a separate terminal:');
+  console.error('[MCP]   proot-distro login alpine -- sh -c "cd /root && node browser-server.js"');
+  console.error('[MCP] Or use the daemon manager:');
+  console.error('[MCP]   bash daemon-manager.sh start');
+  return false;
+}
+
+/**
+ * Ensure browser server is running
+ */
+function ensureBrowserServer() {
+  // Check if server is responding
+  if (!isBrowserServerRunning()) {
+    console.error('[MCP] Browser server not running, attempting to start...');
+    return startBrowserServer();
+  } else {
+    console.error('[MCP] Browser server already running');
+    return true;
+  }
+}
+
 async function main() {
+  // Ensure browser server is running before starting MCP server
+  ensureBrowserServer();
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('Termux Puppeteer MCP server running');
+  console.error('Termux Puppeteer MCP Server v2 (Session-based) running');
 }
+
+// Cleanup on exit - browser server runs independently
+process.on('SIGINT', () => {
+  console.error('[MCP] Shutting down...');
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.error('[MCP] Shutting down...');
+  process.exit(0);
+});
 
 main().catch((error) => {
   console.error('Fatal error:', error);

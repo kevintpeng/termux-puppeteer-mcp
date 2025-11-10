@@ -12,7 +12,17 @@ const sharp = require('sharp');
 const { randomUUID } = require('crypto');
 
 const app = express();
-app.use(express.json({ limit: '50mb' }));
+
+// Fixed JSON middleware to handle empty bodies gracefully
+app.use(express.json({
+  limit: '50mb',
+  verify: (req, res, buf, encoding) => {
+    // Handle empty or null bodies
+    if (buf.length === 0) {
+      req.body = {};
+    }
+  }
+}));
 
 // Configuration
 const CONFIG = {
@@ -199,7 +209,7 @@ app.get('/health', (req, res) => {
  */
 app.post('/session/create', async (req, res) => {
   try {
-    const session = await createSession(req.body.metadata);
+    const session = await createSession(req.body?.metadata);
 
     res.json({
       success: true,

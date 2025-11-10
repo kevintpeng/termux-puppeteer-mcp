@@ -1,6 +1,6 @@
 {
   "name": "termux-puppeteer-mcp",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Puppeteer MCP server for Termux using Alpine Linux",
   "main": "index.js",
   "type": "module",
